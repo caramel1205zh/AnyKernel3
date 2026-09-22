@@ -26,12 +26,7 @@ Built upon [AnyKernel3](https://github.com/osm0sis/AnyKernel3), this repository 
 
 | Android | Kernel Version | Manual Workflow |
 |:---:|:---:|:---:|
-| 12 | 5.10 | `kernel-a12-5-10.yml` |
-| 13 | 5.15 | `kernel-a13-5-15.yml` |
-| 14 | 6.1 | `kernel-a14-6-1.yml` |
-| 15 | 6.6 | `kernel-a15-6-6.yml` |
-| 16 | 6.12 | `kernel-a16-6-12.yml` |
-| Custom | Any | `kernel-custom.yml` |
+| 14 | 6.1.138 | `kernel-a14-6-1.yml` |
 
 ## ✨ Features
 

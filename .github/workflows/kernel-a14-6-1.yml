@@ -1,4 +1,4 @@
-name: 内核构建 - Android 14 (6.1)
+name: 内核构建 - Android 14 (6.1.138)
 
 permissions:
   contents: write
@@ -13,22 +13,22 @@ on:
         type: choice
         options:
           - SukiSU
-          - ReSukiSU
-        default: ReSukiSU
+        default: SukiSU
       version:
-        description: "自定义版本名 (可选)"
+        description: "自定义版本名"
         required: false
         type: string
+        default: "-android14-11-g0c3d559bcd85-ab14529422"
       build_time:
-        description: "自定义构建时间 (可选，留空=自动获取当前北京时间)"
+        description: "自定义构建时间"
         required: false
         type: string
-        default: ""
+        default: "Wed Dec  3 02:05:30 UTC 2025"
       use_kpm:
         description: "KPM 功能"
         required: true
         type: choice
-        default: "disabled (关闭)"
+        default: "enabled (开启)"
         options:
           - "disabled (关闭)"
           - "enabled (开启)"
@@ -42,7 +42,7 @@ on:
           - "678"
           - "123"
           - "345"
-        default: "off"
+        default: "678"
       artifact_upload_mode:
         description: "构建产物上传模式"
         required: true
@@ -55,22 +55,22 @@ on:
         description: "启用 Droidspaces 容器 NTSync 支持（需启用 Droidspaces）"
         required: false
         type: boolean
-        default: false
+        default: true
       use_zram:
         description: "启用 ZRAM 压缩算法"
         required: true
         type: boolean
-        default: false
+        default: true
       use_bbg:
         description: "启用 BBG 基带保护"
         required: true
         type: boolean
-        default: false
+        default: true
       use_net_enhance:
         description: "启用 网络增强 (IPSet + BBR)"
         required: true
         type: boolean
-        default: false
+        default: true
       use_rekernel:
         description: "启用 Re-Kernel 驱动"
         required: false
@@ -80,7 +80,7 @@ on:
         description: "应用 CVE-2026-43499 rtmutex 修复链"
         required: false
         type: boolean
-        default: false
+        default: true
       cancel_susfs:
         description: "禁用 SUSFS"
         required: true
@@ -99,23 +99,27 @@ on:
       version:
         required: false
         type: string
+        default: "-android14-11-g0c3d559bcd85-ab14529422"
       build_time:
         required: false
         type: string
-        default: ""
+        default: "Wed Dec  3 02:05:30 UTC 2025"
       use_zram:
         required: true
         type: boolean
+        default: true
       use_bbg:
         required: true
         type: boolean
+        default: true
       use_net_enhance:
         required: true
         type: boolean
-        default: false
+        default: true
       use_kpm:
         required: true
         type: string
+        default: "enabled (开启)"
       use_rekernel:
         required: false
         type: boolean
@@ -123,22 +127,23 @@ on:
       cve_2026_43499_patch:
         required: false
         type: boolean
-        default: false
+        default: true
       cancel_susfs:
         required: false
         type: boolean
+        default: false
       droidspaces:
         required: false
         type: string
-        default: "off"
+        default: "678"
       artifact_upload_mode:
         required: false
         type: string
-        default: "上传全部"
+        default: "仅上传 AnyKernel3.zip"
       droidspaces_ntsync:
         required: false
         type: boolean
-        default: false
+        default: true
       skip_incompatible:
         required: false
         type: boolean
@@ -156,56 +161,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - sub_level: "25"
-            os_patch_level: "2023-10"
-          - sub_level: "43"
-            os_patch_level: "2023-11"
-          - sub_level: "57"
-            os_patch_level: "2024-01"
-          - sub_level: "68"
-            os_patch_level: "2024-03"
-          - sub_level: "75"
-            os_patch_level: "2024-05"
-          - sub_level: "78"
-            os_patch_level: "2024-06"
-          - sub_level: "84"
-            os_patch_level: "2024-07"
-          - sub_level: "90"
-            os_patch_level: "2024-08"
-          - sub_level: "93"
-            os_patch_level: "2024-09"
-          - sub_level: "99"
-            os_patch_level: "2024-10"
-          - sub_level: "112"
-            os_patch_level: "2024-11"
-          - sub_level: "115"
-            os_patch_level: "2024-12"
-          - sub_level: "118"
-            os_patch_level: "2025-01"
-          - sub_level: "124"
-            os_patch_level: "2025-02"
-          - sub_level: "128"
-            os_patch_level: "2025-03"
-          - sub_level: "129"
-            os_patch_level: "2025-04"
-          - sub_level: "134"
-            os_patch_level: "2025-05"
           - sub_level: "138"
             os_patch_level: "2025-06"
-          - sub_level: "141"
-            os_patch_level: "2025-07"
-          - sub_level: "145"
-            os_patch_level: "2025-09"
-          - sub_level: "157"
-            os_patch_level: "2025-12"
-          - sub_level: "162"
-            os_patch_level: "2026-03"
-          - sub_level: "172"
-            os_patch_level: "2026-06"
-          - sub_level: "176"
-            os_patch_level: "2026-09"
-          - sub_level: "X"
-            os_patch_level: "lts"
     uses: ./.github/workflows/build.yml
     secrets: inherit
     with:
@@ -214,8 +171,8 @@ jobs:
       sub_level: ${{ matrix.sub_level }}
       os_patch_level: ${{ matrix.os_patch_level }}
       ksu_variant: ${{ inputs.kernelsu_variant }}
-      version: ${{ inputs.version || '' }}
-      build_time: ${{ inputs.build_time || '' }}
+      version: ${{ inputs.version || '-android14-11-g0c3d559bcd85-ab14529422' }}
+      build_time: ${{ inputs.build_time || 'Wed Dec  3 02:05:30 UTC 2025' }}
       use_zram: ${{ inputs.use_zram }}
       use_bbg: ${{ inputs.use_bbg }}
       use_net_enhance: ${{ inputs.use_net_enhance }}
@@ -224,8 +181,8 @@ jobs:
       cve_2026_43499_patch: ${{ inputs.cve_2026_43499_patch }}
       supp_op: false
       enable_susfs: ${{ !inputs.cancel_susfs }}
-      droidspaces: ${{ inputs.droidspaces || 'off' }}
-      droidspaces_ntsync: ${{ inputs.droidspaces_ntsync || false }}
+      droidspaces: ${{ inputs.droidspaces || '678' }}
+      droidspaces_ntsync: ${{ inputs.droidspaces_ntsync || true }}
       artifact_upload_mode: ${{ inputs.artifact_upload_mode }}
       skip_incompatible: ${{ inputs.skip_incompatible || false }}
 
