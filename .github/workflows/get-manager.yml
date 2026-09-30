@@ -128,13 +128,17 @@ jobs:
             fi
           }
 
-          DOWNLOAD_LIST=""
-          BEST_VERSION=0
-          BEST_BUILD_ID=""
-          BEST_BRANCH=""
-          RUNS_URL="https://api.github.com/repos/$REPO/actions/workflows/$FILENAME/runs?status=success&per_page=30"
+          # 仿 ReSukiSU_CI 拉取方式：只检索官方 main 分支上传的构建，
+          # 并以下载到的 APK 文件名实测 versionCode 为准（head_sha 推算可能不准），
+          # 确保 artifact 包名与包内 APK 版本严格一致
+          MANAGER_VERSION=""
+          MANAGER_BUILD_ID=""
+          MANAGER_BRANCH=""
+          FETCHED=0
+          MAX_FETCH=5
+          RUNS_URL="https://api.github.com/repos/$REPO/actions/workflows/$FILENAME/runs?status=success&branch=main&per_page=30"
 
-          echo "开始查找不高于 KSU $TARGET_KSU_VERSION 的 Manager 产物..."
+          echo "开始检索官方 main 分支不高于内核 KSU $TARGET_KSU_VERSION 的 Manager 构建..."
           for PAGE in $(seq 1 10); do
             echo "--------------------------------------------------"
             echo "正在检查第 ${PAGE} 页历史构建..."
@@ -159,6 +163,12 @@ jobs:
                 continue
               fi
 
+              # 限制下载校验次数，避免异常情况下流量爆炸
+              if [ "$FETCHED" -ge "$MAX_FETCH" ]; then
+                echo "已下载校验 $FETCHED 个构建，达到上限 $MAX_FETCH，停止检索"
+                break 2
+              fi
+
               ARTIFACTS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
                 "https://api.github.com/repos/$REPO/actions/runs/$BUILD_ID/artifacts")
               CANDIDATE_LIST=$(get_manager_artifacts "$ARTIFACTS")
@@ -167,36 +177,57 @@ jobs:
                 continue
               fi
 
-              if [ -z "$DOWNLOAD_LIST" ] || [ "$RUN_KSU_VERSION" -gt "$BEST_VERSION" ]; then
-                DOWNLOAD_LIST="$CANDIDATE_LIST"
-                BEST_VERSION="$RUN_KSU_VERSION"
-                BEST_BUILD_ID="$BUILD_ID"
-                BEST_BRANCH="$HEAD_BRANCH"
-                echo "候选 Manager: 构建 $BUILD_ID ($HEAD_BRANCH), KSU $RUN_KSU_VERSION"
+              # 下载并解压该构建实际上传的 Manager 产物
+              FETCHED=$((FETCHED + 1))
+              echo "下载构建 $BUILD_ID ($HEAD_BRANCH, 推算 KSU $RUN_KSU_VERSION) 的产物..."
+              rm -rf manager-artifacts
+              mkdir -p manager-artifacts
+              while IFS=$'\t' read -r NAME URL; do
+                SAFE_NAME=$(echo "$NAME" | tr '/ ' '__')
+                if ! curl -sL --fail -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                  -o "manager-artifacts/$SAFE_NAME.zip" "$URL"; then
+                  echo "下载 $NAME 失败"
+                  continue
+                fi
+                mkdir -p "manager-artifacts/$SAFE_NAME"
+                unzip -oq "manager-artifacts/$SAFE_NAME.zip" -d "manager-artifacts/$SAFE_NAME" || echo "解压 $NAME 失败"
+                rm -f "manager-artifacts/$SAFE_NAME.zip"
+              done <<< "$CANDIDATE_LIST"
+
+              # 从 APK 文件名提取实测 versionCode
+              APK_FILE=$(find manager-artifacts -type f -name "*.apk" ! -name "*debug*" | head -n 1)
+              if [ -z "$APK_FILE" ]; then
+                echo "跳过构建 $BUILD_ID ($HEAD_BRANCH): artifact 中无 release APK"
+                continue
+              fi
+              ACTUAL_VERSION=$(basename "$APK_FILE" | grep -oE '_[0-9]+' | tail -n 1 | tr -d '_')
+              if ! [[ "$ACTUAL_VERSION" =~ ^[0-9]+$ ]]; then
+                echo "警告: 无法从 APK 文件名解析版本 ($(basename "$APK_FILE"))，回退使用推算值 $RUN_KSU_VERSION"
+                ACTUAL_VERSION="$RUN_KSU_VERSION"
+              fi
+              if [ "$ACTUAL_VERSION" -gt "$TARGET_KSU_VERSION" ]; then
+                echo "跳过构建 $BUILD_ID ($HEAD_BRANCH): APK 实测版本 $ACTUAL_VERSION 高于内核 KSU $TARGET_KSU_VERSION（推算值不可信）"
+                continue
               fi
 
-              if [ "$RUN_KSU_VERSION" -eq "$TARGET_KSU_VERSION" ]; then
-                break 2
+              MANAGER_VERSION="$ACTUAL_VERSION"
+              MANAGER_BUILD_ID="$BUILD_ID"
+              MANAGER_BRANCH="$HEAD_BRANCH"
+              if [ "$ACTUAL_VERSION" -eq "$TARGET_KSU_VERSION" ]; then
+                echo "精确匹配: 构建 $BUILD_ID ($HEAD_BRANCH), APK 实测版本 $ACTUAL_VERSION = 内核 KSU $TARGET_KSU_VERSION"
+              else
+                echo "::warning::官方 main 分支暂无等于内核 KSU $TARGET_KSU_VERSION 的 Manager 构建，使用最新可用版本 $ACTUAL_VERSION（构建 $BUILD_ID, $HEAD_BRANCH）"
               fi
+              break 2
             done
           done
 
-          if [ -z "$DOWNLOAD_LIST" ]; then
-            echo "未获取到 KSU 版本小于等于 $TARGET_KSU_VERSION 的 Manager artifact 下载地址列表。"
+          if [ -z "$MANAGER_VERSION" ]; then
+            echo "未获取到 KSU 版本小于等于 $TARGET_KSU_VERSION 的 Manager artifact。"
             exit 1
           fi
-          echo "选择 Manager 构建 $BEST_BUILD_ID ($BEST_BRANCH), KSU $BEST_VERSION"
-
-          # 下载并解压所有 Manager 产物
-          echo "$DOWNLOAD_LIST" | while IFS=$'\t' read -r NAME URL; do
-            SAFE_NAME=$(echo "$NAME" | tr '/ ' '__')
-            ZIP_NAME="${{ inputs.kernelsu_variant }}-${SAFE_NAME}(${{ env.KSU_VERSION }}).zip"
-            echo "下载 $NAME -> $ZIP_NAME"
-            curl -L -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" -o "$ZIP_NAME" "$URL"
-            mkdir -p "manager-artifacts/$SAFE_NAME"
-            unzip -o "$ZIP_NAME" -d "manager-artifacts/$SAFE_NAME"
-            rm -rf "$ZIP_NAME"
-          done
+          echo "选择 Manager 构建 $MANAGER_BUILD_ID ($MANAGER_BRANCH), APK 实测版本 $MANAGER_VERSION"
+          echo "MANAGER_VERSION=$MANAGER_VERSION" >> $GITHUB_ENV
 
           if [ "${{ inputs.kernelsu_variant }}" == "ReSukiSU" ]; then
             echo "仅保留 ReSukiSU arm64-v8a release 管理器..."
@@ -213,41 +244,46 @@ jobs:
         id: add_SUSFS
         continue-on-error: true
         run: |
-          BUILD_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-          "https://api.github.com/repos/sidex15/susfs4ksu-module/actions/workflows/build.yml/runs?status=success" |
-          jq -r '.workflow_runs[0].id')
-
-          ARTIFACTS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-          "https://api.github.com/repos/sidex15/susfs4ksu-module/actions/runs/$BUILD_ID/artifacts")
-
-          DOWNLOAD_URL=$(echo "$ARTIFACTS" | jq -r '.artifacts[0].archive_download_url')
-
-          NAME=$(echo "$ARTIFACTS" | jq -r '.artifacts[0].name')
-          echo "SUSFS_NAME=$NAME" >> $GITHUB_ENV
-          NAME="susfs-$NAME.zip"
-
-          echo $DOWNLOAD_URL
-          echo $NAME
-          # 下载 Manager 文件
-          curl -L -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" -o "$NAME" "$DOWNLOAD_URL"
-          echo "$NAME 文件已下载.zip"
-
-
-          # 解压 artifact zip 获取里面的模块文件
-          mkdir -p susfs-module
-          unzip "$NAME" -d susfs-temp
-
-          # 检查解压后的内容：如果是散装文件则打包成 zip
-          cd susfs-temp
-          if ls *.zip 1>/dev/null 2>&1; then
-            # 里面已经是 zip 文件，直接移动
-            mv *.zip ../susfs-module/
-          else
-            # 是散装文件，打包成 zip
-            zip -r "../susfs-module/ksu_module_susfs.zip" .
+          # 上游 susfs4ksu-module 的 Actions artifacts 已全部过期，
+          # 模块现通过 GitHub Releases 发布，改为拉取最新 Release 资产
+          RELEASE_API="https://api.github.com/repos/sidex15/susfs4ksu-module/releases/latest"
+          RELEASE_JSON=""
+          for ATTEMPT in 1 2 3; do
+            RELEASE_JSON=$(curl -s --fail --max-time 30 \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "$RELEASE_API") \
+              && [ -n "$RELEASE_JSON" ] && break
+            echo "获取 Release 信息失败，重试 ($ATTEMPT/3)..."
+            sleep 5
+          done
+          if [ -z "$RELEASE_JSON" ]; then
+            echo "无法获取 susfs4ksu-module 最新 Release 信息"
+            exit 1
           fi
-          cd ..
-          rm -rf susfs-temp "$NAME"
+
+          TAG_NAME=$(printf '%s' "$RELEASE_JSON" | jq -r '.tag_name')
+          ASSET_URL=$(printf '%s' "$RELEASE_JSON" | jq -r '.assets[] | select((.name | contains("ksu_module_susfs")) and (.name | endswith(".zip"))) | .browser_download_url' | head -n 1)
+
+          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
+            echo "Release $TAG_NAME 中未找到 ksu_module_susfs 模块 zip"
+            exit 1
+          fi
+
+          NAME="ksu_module_susfs.zip"
+          echo "下载 SUSFS 模块: $NAME (Release $TAG_NAME)"
+          if ! curl -sL --fail --retry 3 --max-time 120 -o "$NAME" "$ASSET_URL"; then
+            echo "下载 SUSFS 模块失败: $ASSET_URL"
+            exit 1
+          fi
+          echo "SUSFS_NAME=$TAG_NAME" >> $GITHUB_ENV
+
+          # Release 资产本身即完整模块 zip，校验完整性后直接放入模块目录
+          if ! unzip -t "$NAME" >/dev/null 2>&1; then
+            echo "下载的 SUSFS 模块 zip 损坏"
+            exit 1
+          fi
+          mkdir -p susfs-module
+          mv "$NAME" "susfs-module/$NAME"
+          ls -la susfs-module/
 
       - name: Notify on failure
         if: steps.add_KSU.outcome == 'failure'
@@ -257,7 +293,7 @@ jobs:
         if: steps.add_KSU.outcome == 'success'
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ inputs.kernelsu_variant }}-Manager(${{ env.KSU_VERSION }})
+          name: ${{ inputs.kernelsu_variant }}-Manager(${{ env.MANAGER_VERSION }})
           path: |
             manager-artifacts/**/*.apk
 
