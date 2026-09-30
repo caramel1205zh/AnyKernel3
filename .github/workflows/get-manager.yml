@@ -91,32 +91,6 @@ jobs:
 
           FILENAME="build-manager.yml"
 
-
-          # 按内核 KSU 版本选择 Manager，避免 APK 版本领先于内核版本
-          TARGET_KSU_VERSION="${KSU_VERSION:-}"
-          if ! [[ "$TARGET_KSU_VERSION" =~ ^[0-9]+$ ]]; then
-            echo "无效的目标 KSU 版本: $TARGET_KSU_VERSION"
-            exit 1
-          fi
-
-          calculate_run_ksu_version() {
-            local head_sha="$1"
-            if ! git -C KernelSU cat-file -e "$head_sha^{commit}" 2>/dev/null; then
-              git -C KernelSU fetch --no-tags origin "$head_sha" >/dev/null 2>&1 || true
-            fi
-            if ! git -C KernelSU cat-file -e "$head_sha^{commit}" 2>/dev/null; then
-              return 1
-            fi
-
-            local git_version
-            git_version=$(git -C KernelSU rev-list --count "$head_sha")
-            case "${{ inputs.kernelsu_variant }}" in
-              "SukiSU") echo $((40000 + git_version - 2815)) ;;
-              "ReSukiSU") echo $((30700 + git_version)) ;;
-              *) return 1 ;;
-            esac
-          }
-
           get_manager_artifacts() {
             local artifacts="$1"
             if [ "${{ inputs.kernelsu_variant }}" == "ReSukiSU" ]; then
@@ -128,105 +102,112 @@ jobs:
             fi
           }
 
-          # 仿 ReSukiSU_CI 拉取方式：只检索官方 main 分支上传的构建，
-          # 并以下载到的 APK 文件名实测 versionCode 为准（head_sha 推算可能不准），
-          # 确保 artifact 包名与包内 APK 版本严格一致
-          MANAGER_VERSION=""
-          MANAGER_BUILD_ID=""
-          MANAGER_BRANCH=""
-          FETCHED=0
-          MAX_FETCH=5
-          RUNS_URL="https://api.github.com/repos/$REPO/actions/workflows/$FILENAME/runs?status=success&branch=main&per_page=30"
+          # 仿 ReSukiSU_CI：只拉取官方 main 分支最新上传（push）的 Manager 构建，
+          # 并以下载到的 APK 文件名实测 versionCode 命名，确保包名与包内容严格一致
+          # 注意：runs 列表 API 的排序/缓存在部分仓库不可靠（可能漏掉最新构建），
+          # 而 created 日期过滤参数走可靠查询路径，因此按日期窗口从今天往回推进检索
+          RUNS_BASE="https://api.github.com/repos/$REPO/actions/workflows/$FILENAME/runs?status=success"
+          CAND_FILE=$(mktemp)
+          TODAY=$(date -u +%Y-%m-%d)
 
-          echo "开始检索官方 main 分支不高于内核 KSU $TARGET_KSU_VERSION 的 Manager 构建..."
-          for PAGE in $(seq 1 10); do
-            echo "--------------------------------------------------"
-            echo "正在检查第 ${PAGE} 页历史构建..."
-            RUNS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "$RUNS_URL&page=$PAGE")
-            RUN_COUNT=$(printf '%s' "$RUNS" | jq '.workflow_runs | length')
-            if [ "$RUN_COUNT" -eq 0 ]; then
-              break
+          for DAYS in 0 7 30 90 365; do
+            if [ "$DAYS" -eq 0 ]; then
+              FROM="$TODAY"
+            else
+              FROM=$(date -u -d "today - $DAYS days" +%Y-%m-%d)
             fi
-
-            for INDEX in $(seq 0 $((RUN_COUNT - 1))); do
-              BUILD_ID=$(printf '%s' "$RUNS" | jq -r ".workflow_runs[$INDEX].id")
-              HEAD_SHA=$(printf '%s' "$RUNS" | jq -r ".workflow_runs[$INDEX].head_sha")
-              HEAD_BRANCH=$(printf '%s' "$RUNS" | jq -r ".workflow_runs[$INDEX].head_branch")
-
-              RUN_KSU_VERSION=$(calculate_run_ksu_version "$HEAD_SHA" || true)
-              if ! [[ "$RUN_KSU_VERSION" =~ ^[0-9]+$ ]]; then
-                echo "跳过构建 $BUILD_ID: 无法根据提交 $HEAD_SHA 计算 KSU 版本"
-                continue
+            echo "检索 $FROM ~ $TODAY 期间官方 main 分支 push 构建..."
+            for PAGE in 1 2 3; do
+              RUNS=""
+              for ATTEMPT in 1 2 3; do
+                RUNS=$(curl -s --fail --max-time 30 -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                  "$RUNS_BASE&created=$FROM..$TODAY&per_page=30&page=$PAGE") && [ -n "$RUNS" ] && break
+                echo "查询构建列表失败，重试 ($ATTEMPT/3)..."
+                RUNS=""
+                sleep 3
+              done
+              RUN_COUNT=$(printf '%s' "$RUNS" | jq '.workflow_runs | length')
+              if [ "$RUN_COUNT" -eq 0 ]; then
+                break
               fi
-              if [ "$RUN_KSU_VERSION" -gt "$TARGET_KSU_VERSION" ]; then
-                echo "跳过构建 $BUILD_ID ($HEAD_BRANCH): Manager KSU $RUN_KSU_VERSION 高于内核 KSU $TARGET_KSU_VERSION"
-                continue
-              fi
-
-              # 限制下载校验次数，避免异常情况下流量爆炸
-              if [ "$FETCHED" -ge "$MAX_FETCH" ]; then
-                echo "已下载校验 $FETCHED 个构建，达到上限 $MAX_FETCH，停止检索"
-                break 2
-              fi
-
-              ARTIFACTS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                "https://api.github.com/repos/$REPO/actions/runs/$BUILD_ID/artifacts")
-              CANDIDATE_LIST=$(get_manager_artifacts "$ARTIFACTS")
-              if [ -z "$CANDIDATE_LIST" ]; then
-                echo "跳过构建 $BUILD_ID ($HEAD_BRANCH): 未找到包含 '$KSUM' 的产物"
-                continue
-              fi
-
-              # 下载并解压该构建实际上传的 Manager 产物
-              FETCHED=$((FETCHED + 1))
-              echo "下载构建 $BUILD_ID ($HEAD_BRANCH, 推算 KSU $RUN_KSU_VERSION) 的产物..."
-              rm -rf manager-artifacts
-              mkdir -p manager-artifacts
-              while IFS=$'\t' read -r NAME URL; do
-                SAFE_NAME=$(echo "$NAME" | tr '/ ' '__')
-                if ! curl -sL --fail -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                  -o "manager-artifacts/$SAFE_NAME.zip" "$URL"; then
-                  echo "下载 $NAME 失败"
+              for INDEX in $(seq 0 $((RUN_COUNT - 1))); do
+                BUILD_ID=$(printf '%s' "$RUNS" | jq -r ".workflow_runs[$INDEX].id")
+                HEAD_SHA=$(printf '%s' "$RUNS" | jq -r ".workflow_runs[$INDEX].head_sha")
+                HEAD_BRANCH=$(printf '%s' "$RUNS" | jq -r ".workflow_runs[$INDEX].head_branch")
+                EVENT=$(printf '%s' "$RUNS" | jq -r ".workflow_runs[$INDEX].event")
+                CREATED=$(printf '%s' "$RUNS" | jq -r ".workflow_runs[$INDEX].created_at")
+                # 只认官方 main 分支 push 上传的构建，跳过 PR / 其他分支构建
+                if [ "$HEAD_BRANCH" != "main" ] || [ "$EVENT" != "push" ]; then
+                  echo "跳过构建 $BUILD_ID ($HEAD_BRANCH/$EVENT): 非官方 main push 构建"
                   continue
                 fi
-                mkdir -p "manager-artifacts/$SAFE_NAME"
-                unzip -oq "manager-artifacts/$SAFE_NAME.zip" -d "manager-artifacts/$SAFE_NAME" || echo "解压 $NAME 失败"
-                rm -f "manager-artifacts/$SAFE_NAME.zip"
-              done <<< "$CANDIDATE_LIST"
-
-              # 从 APK 文件名提取实测 versionCode
-              APK_FILE=$(find manager-artifacts -type f -name "*.apk" ! -name "*debug*" | head -n 1)
-              if [ -z "$APK_FILE" ]; then
-                echo "跳过构建 $BUILD_ID ($HEAD_BRANCH): artifact 中无 release APK"
-                continue
-              fi
-              ACTUAL_VERSION=$(basename "$APK_FILE" | grep -oE '_[0-9]+' | tail -n 1 | tr -d '_')
-              if ! [[ "$ACTUAL_VERSION" =~ ^[0-9]+$ ]]; then
-                echo "警告: 无法从 APK 文件名解析版本 ($(basename "$APK_FILE"))，回退使用推算值 $RUN_KSU_VERSION"
-                ACTUAL_VERSION="$RUN_KSU_VERSION"
-              fi
-              if [ "$ACTUAL_VERSION" -gt "$TARGET_KSU_VERSION" ]; then
-                echo "跳过构建 $BUILD_ID ($HEAD_BRANCH): APK 实测版本 $ACTUAL_VERSION 高于内核 KSU $TARGET_KSU_VERSION（推算值不可信）"
-                continue
-              fi
-
-              MANAGER_VERSION="$ACTUAL_VERSION"
-              MANAGER_BUILD_ID="$BUILD_ID"
-              MANAGER_BRANCH="$HEAD_BRANCH"
-              if [ "$ACTUAL_VERSION" -eq "$TARGET_KSU_VERSION" ]; then
-                echo "精确匹配: 构建 $BUILD_ID ($HEAD_BRANCH), APK 实测版本 $ACTUAL_VERSION = 内核 KSU $TARGET_KSU_VERSION"
-              else
-                echo "::warning::官方 main 分支暂无等于内核 KSU $TARGET_KSU_VERSION 的 Manager 构建，使用最新可用版本 $ACTUAL_VERSION（构建 $BUILD_ID, $HEAD_BRANCH）"
-              fi
-              break 2
+                printf '%s\t%s\t%s\n' "$CREATED" "$BUILD_ID" "$HEAD_SHA" >> "$CAND_FILE"
+              done
             done
+            if [ -s "$CAND_FILE" ]; then
+              break
+            fi
           done
 
-          if [ -z "$MANAGER_VERSION" ]; then
-            echo "未获取到 KSU 版本小于等于 $TARGET_KSU_VERSION 的 Manager artifact。"
+          if [ ! -s "$CAND_FILE" ]; then
+            rm -f "$CAND_FILE"
+            echo "未找到官方 main 分支 push 上传的 Manager 构建。"
             exit 1
           fi
-          echo "选择 Manager 构建 $MANAGER_BUILD_ID ($MANAGER_BRANCH), APK 实测版本 $MANAGER_VERSION"
+          # sort -u 去重（窗口扩大后会重复收集），按创建时间降序（最新优先）
+          CAND_COUNT=$(sort -u -t$'\t' -k1,1r "$CAND_FILE" | wc -l)
+          echo "共找到 $CAND_COUNT 个官方 main push 构建，从最新开始逐个下载（以 APK 文件名实测版本）..."
+
+          while IFS=$'\t' read -r CREATED BUILD_ID HEAD_SHA; do
+            ARTIFACTS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/$REPO/actions/runs/$BUILD_ID/artifacts")
+            CANDIDATE_LIST=$(get_manager_artifacts "$ARTIFACTS")
+            if [ -z "$CANDIDATE_LIST" ]; then
+              echo "跳过构建 $BUILD_ID (main, $CREATED): 未找到包含 '$KSUM' 的产物"
+              continue
+            fi
+
+            echo "下载构建 $BUILD_ID (main, $CREATED, ${HEAD_SHA:0:8}) 的产物..."
+            rm -rf manager-artifacts
+            mkdir -p manager-artifacts
+            while IFS=$'\t' read -r NAME URL; do
+              SAFE_NAME=$(echo "$NAME" | tr '/ ' '__')
+              if ! curl -sL --fail -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                -o "manager-artifacts/$SAFE_NAME.zip" "$URL"; then
+                echo "下载 $NAME 失败"
+                continue
+              fi
+              mkdir -p "manager-artifacts/$SAFE_NAME"
+              unzip -oq "manager-artifacts/$SAFE_NAME.zip" -d "manager-artifacts/$SAFE_NAME" || echo "解压 $NAME 失败"
+              rm -f "manager-artifacts/$SAFE_NAME.zip"
+            done <<< "$CANDIDATE_LIST"
+
+            # 从 APK 文件名提取实测 versionCode 作为 artifact 命名
+            APK_FILE=$(find manager-artifacts -type f -name "*.apk" ! -name "*debug*" | head -n 1)
+            if [ -z "$APK_FILE" ]; then
+              echo "跳过构建 $BUILD_ID (main, $CREATED): artifact 中无 release APK"
+              continue
+            fi
+            ACTUAL_VERSION=$(basename "$APK_FILE" | grep -oE '_[0-9]+' | tail -n 1 | tr -d '_')
+            if ! [[ "$ACTUAL_VERSION" =~ ^[0-9]+$ ]]; then
+              echo "跳过构建 $BUILD_ID (main, $CREATED): 无法从 APK 文件名解析版本 ($(basename "$APK_FILE"))"
+              continue
+            fi
+
+            MANAGER_VERSION="$ACTUAL_VERSION"
+            MANAGER_BUILD_ID="$BUILD_ID"
+            break
+          done < <(sort -u -t$'\t' -k1,1r "$CAND_FILE")
+          rm -f "$CAND_FILE"
+
+          if [ -z "$MANAGER_VERSION" ]; then
+            echo "未获取到官方 main 分支最新上传的 Manager artifact。"
+            exit 1
+          fi
+          echo "选择 Manager 构建 $MANAGER_BUILD_ID (main), APK 实测版本 $MANAGER_VERSION"
+          if [ -n "${KSU_VERSION:-}" ] && [ "$MANAGER_VERSION" != "$KSU_VERSION" ]; then
+            echo "::warning::Manager 实测版本 $MANAGER_VERSION 与内核 KSU 版本 ${KSU_VERSION} 不一致（已按需求拉取官方最新上传的构建）"
+          fi
           echo "MANAGER_VERSION=$MANAGER_VERSION" >> $GITHUB_ENV
 
           if [ "${{ inputs.kernelsu_variant }}" == "ReSukiSU" ]; then
